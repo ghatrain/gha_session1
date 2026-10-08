@@ -22,3 +22,7 @@ def test_divide():
 def test_divide_by_zero():
     with pytest.raises(ValueError):
         calculator.divide(1, 0)
+
+
+def test_power():
+    assert calculator.power(2, 10) == 1024
