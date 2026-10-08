@@ -12,8 +12,6 @@ OPERATIONS = {
     "subtract": calculator.subtract,
     "multiply": calculator.multiply,
     "divide": calculator.divide,
-    # DEMO (missing dependency): uncomment together with power() in calculator.py
-    "power": calculator.power,
 }
 
 app = Flask(__name__)
