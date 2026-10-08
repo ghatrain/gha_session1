@@ -1,0 +1,144 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint with ruff
+        run: ruff check .
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -v --cov=app --cov-report=term --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+
+  build-and-push:
+    needs: test
+    # Only deliver on pushes to main, not on pull requests
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            -t "${IMAGE_NAME,,}:${{ github.sha }}" \
+            -t "${IMAGE_NAME,,}:latest" .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name smoke -p 5000:5000 "${IMAGE_NAME,,}:${{ github.sha }}"
+          for i in $(seq 1 10); do
+            curl -fs http://localhost:5000/health && exit 0
+            sleep 1
+          done
+          docker logs smoke
+          exit 1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image
+        run: |
+          docker push "${IMAGE_NAME,,}:${{ github.sha }}"
+          docker push "${IMAGE_NAME,,}:latest"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    concurrency: databricks-deploy
+    environment:
+      name: databricks_prod
+      url: ${{ steps.deploy.outputs.app_url }}
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      APP_NAME: gha-ci-cd-demo
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Stamp version into app.yaml
+        run: sed -i "s/__APP_VERSION__/${GITHUB_SHA::7}/" app.yaml
+
+      - name: Ensure app exists and is running
+        run: |
+          if ! databricks apps get "$APP_NAME" > /dev/null 2>&1; then
+            databricks apps create "$APP_NAME" --description "GitHub Actions CI/CD demo"
+          fi
+          state=$(databricks apps get "$APP_NAME" -o json | jq -r '.compute_status.state')
+          echo "App compute state: $state"
+          if [ "$state" = "STOPPED" ]; then
+            databricks apps start "$APP_NAME"
+          fi
+
+      - name: Upload source code to workspace
+        run: |
+          user=$(databricks current-user me -o json | jq -r .userName)
+          source_path="/Workspace/Users/$user/$APP_NAME"
+          echo "SOURCE_PATH=$source_path" >> "$GITHUB_ENV"
+          databricks sync --full . "$source_path"
+
+      - name: Deploy app
+        id: deploy
+        run: |
+          databricks apps deploy "$APP_NAME" --source-code-path "$SOURCE_PATH"
+          echo "app_url=$(databricks apps get "$APP_NAME" -o json | jq -r .url)" >> "$GITHUB_OUTPUT"

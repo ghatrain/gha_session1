@@ -1,0 +1,8 @@
+command: ["gunicorn", "app.main:app"]
+
+env:
+  - name: APP_ENV
+    value: "Databricks Apps"
+  # Replaced with the commit SHA by the deploy job
+  - name: APP_VERSION
+    value: "__APP_VERSION__"
